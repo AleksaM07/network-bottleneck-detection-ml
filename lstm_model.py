@@ -32,7 +32,7 @@ from sklearn.preprocessing import StandardScaler
 BASE_DATA_PATH = Path("data/data.csv")
 SEQUENCE_DATA_PATH = Path("data/data_with_sequence.csv")
 AUGMENTED_DATA_PATH = Path("data/data_augmented.csv")
-DATA_PATH = AUGMENTED_DATA_PATH
+DATA_PATH = SEQUENCE_DATA_PATH
 REPORTS_DIR = Path("reports")
 TARGET_COLUMN = "Limitation"
 SPLIT_DATE_COLUMN = "observation_date"
@@ -46,6 +46,8 @@ EPOCHS = 30
 BATCH_SIZE = 128
 LEGACY_COMPARABLE_EPOCHS = 20
 LEGACY_COMPARABLE_BATCH_SIZE = 32
+POLYNOMIAL_WINDOW_SIZE = 50
+POLYNOMIAL_MIN_POINTS = 8
 
 SEQUENCE_GROUP_COLUMNS = ["Operator", "System ID", "Server IP Address"]
 EXCLUDED_FEATURE_COLUMNS = {
@@ -205,6 +207,7 @@ def add_engineered_features(data: pd.DataFrame) -> pd.DataFrame:
         )
 
     data = add_sequence_context_features(data)
+    data = add_polynomial_throughput_features(data)
 
     group_columns = [column for column in SEQUENCE_GROUP_COLUMNS if column in data.columns]
     if not group_columns:
@@ -431,6 +434,141 @@ def add_same_ip_run_features(
         output["feature_same_ip_run_length"] >= 3
     ).astype(float)
     return output
+
+
+def add_polynomial_throughput_features(data: pd.DataFrame) -> pd.DataFrame:
+    """Fit local quadratic throughput curves and expose residual features.
+
+    This turns the scatter-plot idea into ML input: within each day/operator/
+    system/route slice, fit a second-degree curve over chunks of about 50
+    sequence-ordered points, then measure how far each row falls below the local
+    expected throughput envelope.
+    """
+    required = {"Sequence", "Transfer Throughput [kbit/s]", SPLIT_DATE_COLUMN}
+    if not required <= set(data.columns):
+        return data
+
+    group_columns = [
+        column
+        for column in [SPLIT_DATE_COLUMN, "Operator", "System ID", "Route Name"]
+        if column in data.columns
+    ]
+    if not group_columns:
+        return data
+
+    output = data.sort_values(sequence_order_columns(data, group_columns)).copy()
+    feature_columns = [
+        "feature_poly_expected_throughput",
+        "feature_poly_residual",
+        "feature_poly_below_expected_ratio",
+        "feature_poly_abs_residual_ratio",
+        "feature_poly_local_residual_zscore",
+        "feature_poly_window_size",
+        "feature_poly_window_position_pct",
+        "feature_poly_fit_degree",
+    ]
+    for column in feature_columns:
+        output[column] = np.nan
+
+    for _, group in output.groupby(group_columns, dropna=False, sort=False):
+        if len(group) < POLYNOMIAL_MIN_POINTS:
+            continue
+        for start in range(0, len(group), POLYNOMIAL_WINDOW_SIZE):
+            chunk = group.iloc[start : start + POLYNOMIAL_WINDOW_SIZE]
+            add_polynomial_window_features(output, chunk)
+
+    if "Server IP Address" in output.columns:
+        output = add_same_ip_polynomial_features(output, group_columns)
+
+    return output.sort_index()
+
+
+def add_polynomial_window_features(output: pd.DataFrame, chunk: pd.DataFrame) -> None:
+    """Mutate output with local polynomial residuals for one sequence window."""
+    x_values = numeric_column(chunk, "Sequence")
+    y_values = numeric_column(chunk, "Transfer Throughput [kbit/s]")
+    valid = x_values.notna() & y_values.notna() & np.isfinite(x_values) & np.isfinite(y_values)
+    if int(valid.sum()) < POLYNOMIAL_MIN_POINTS:
+        return
+
+    x_valid = x_values[valid].to_numpy(dtype=float)
+    y_valid = y_values[valid].to_numpy(dtype=float)
+    envelope_cutoff = np.nanquantile(y_valid, 0.35)
+    envelope_mask = y_valid >= envelope_cutoff
+    if int(envelope_mask.sum()) < POLYNOMIAL_MIN_POINTS:
+        envelope_mask = np.ones_like(y_valid, dtype=bool)
+
+    x_mean = float(np.mean(x_valid[envelope_mask]))
+    x_scale = float(np.std(x_valid[envelope_mask]))
+    if not np.isfinite(x_scale) or x_scale == 0:
+        x_scale = 1.0
+
+    x_fit = (x_valid[envelope_mask] - x_mean) / x_scale
+    y_fit = y_valid[envelope_mask]
+    degree = min(2, len(np.unique(x_fit)) - 1)
+    if degree < 1:
+        return
+
+    coefficients = np.polyfit(x_fit, y_fit, degree)
+    x_all = (x_values.to_numpy(dtype=float) - x_mean) / x_scale
+    expected = np.polyval(coefficients, x_all)
+    lower_bound = max(float(np.nanquantile(y_valid, 0.01)) * 0.25, 1.0)
+    upper_bound = max(float(np.nanquantile(y_valid, 0.99)) * 1.50, lower_bound)
+    expected = np.clip(expected, lower_bound, upper_bound)
+    actual = y_values.to_numpy(dtype=float)
+    residual = actual - expected
+    denominator = np.where(np.abs(expected) > 1e-9, np.abs(expected), np.nan)
+    below_expected_ratio = (expected - actual) / denominator
+    abs_residual_ratio = np.abs(residual) / denominator
+    residual_std = float(np.nanstd(residual))
+    if not np.isfinite(residual_std) or residual_std == 0:
+        residual_std = 1.0
+    residual_zscore = residual / residual_std
+    below_expected_ratio = np.clip(below_expected_ratio, -5.0, 5.0)
+    abs_residual_ratio = np.clip(abs_residual_ratio, 0.0, 5.0)
+    residual_zscore = np.clip(residual_zscore, -5.0, 5.0)
+
+    positions = np.arange(1, len(chunk) + 1, dtype=float) / max(len(chunk), 1)
+    output.loc[chunk.index, "feature_poly_expected_throughput"] = expected
+    output.loc[chunk.index, "feature_poly_residual"] = residual
+    output.loc[chunk.index, "feature_poly_below_expected_ratio"] = below_expected_ratio
+    output.loc[chunk.index, "feature_poly_abs_residual_ratio"] = abs_residual_ratio
+    output.loc[chunk.index, "feature_poly_local_residual_zscore"] = residual_zscore
+    output.loc[chunk.index, "feature_poly_window_size"] = int(valid.sum())
+    output.loc[chunk.index, "feature_poly_window_position_pct"] = positions
+    output.loc[chunk.index, "feature_poly_fit_degree"] = degree
+
+
+def add_same_ip_polynomial_features(
+    data: pd.DataFrame,
+    context_group_columns: list[str],
+) -> pd.DataFrame:
+    """Summarize polynomial residuals inside contiguous same-IP runs."""
+    output = data.copy()
+    context_grouped = output.groupby(context_group_columns, dropna=False, sort=False)
+    output["_poly_same_ip_run_id"] = context_grouped["Server IP Address"].transform(
+        lambda values: values.fillna("missing").ne(values.fillna("missing").shift()).cumsum()
+    )
+    run_columns = context_group_columns + ["_poly_same_ip_run_id"]
+    run_grouped = output.groupby(run_columns, dropna=False, sort=False)
+    below = output["feature_poly_below_expected_ratio"]
+    below_grouped = below.groupby(
+        [output[column] for column in run_columns],
+        dropna=False,
+        sort=False,
+    )
+
+    output["feature_same_ip_poly_below_mean"] = below_grouped.transform("mean")
+    output["feature_same_ip_poly_below_max"] = below_grouped.transform("max")
+    output["feature_same_ip_poly_below_std"] = below_grouped.transform("std")
+    output["feature_same_ip_poly_below_count_10pct"] = below_grouped.transform(
+        lambda values: int((values > 0.10).sum())
+    )
+    output["feature_same_ip_poly_run_length"] = run_grouped["Server IP Address"].transform(
+        "size"
+    )
+    output["feature_same_ip_poly_all_one_ip"] = 1.0
+    return output.drop(columns=["_poly_same_ip_run_id"], errors="ignore")
 
 
 def stable_hash_bucket(value: str, buckets: int = HASH_BUCKETS) -> int:

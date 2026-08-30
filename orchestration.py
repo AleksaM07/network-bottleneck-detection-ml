@@ -5,7 +5,6 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from augment_limited_sequences import augment_limited_sequences
 from lstm_model import REPORTS_DIR, run_model
 from model_search import run_search
 from report_maker import make_report
@@ -30,7 +29,10 @@ def reset_reports_dir(reports_dir: Path = REPORTS_DIR) -> None:
 def main() -> None:
     """Train the model and generate reports."""
     reset_reports_dir()
-    augment_limited_sequences(report_path=REPORTS_DIR / "augmentation_summary.csv")
+    # Augmentation is intentionally disabled by default. It stayed useful as an
+    # experiment, but the 10k synthetic-limited run hurt chronological results.
+    # from augment_limited_sequences import augment_limited_sequences
+    # augment_limited_sequences(report_path=REPORTS_DIR / "augmentation_summary.csv")
     metrics = run_model(reports_dir=REPORTS_DIR)
     search_results = run_search(reports_dir=REPORTS_DIR)
     report_path = make_report(reports_dir=REPORTS_DIR)
