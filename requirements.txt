@@ -3,3 +3,7 @@ pandas==3.0.5
 scikit-learn==1.9.0
 matplotlib==3.11.1
 tensorflow==2.21.0
+xgboost==3.4.1
+lightgbm==4.7.0
+openpyxl==3.1.5
+python-calamine==0.8.2

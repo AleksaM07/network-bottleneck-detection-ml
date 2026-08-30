@@ -29,10 +29,14 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 
-DATA_PATH = Path("data/data.csv")
+BASE_DATA_PATH = Path("data/data.csv")
+SEQUENCE_DATA_PATH = Path("data/data_with_sequence.csv")
+AUGMENTED_DATA_PATH = Path("data/data_augmented.csv")
+DATA_PATH = AUGMENTED_DATA_PATH
 REPORTS_DIR = Path("reports")
 TARGET_COLUMN = "Limitation"
 SPLIT_DATE_COLUMN = "observation_date"
+SYNTHETIC_COLUMN = "_is_synthetic_limited"
 TRAIN_END_DATE = "2024-05-10"
 VALIDATION_END_DATE = "2024-05-15"
 RANDOM_SEED = 17
@@ -44,7 +48,28 @@ LEGACY_COMPARABLE_EPOCHS = 20
 LEGACY_COMPARABLE_BATCH_SIZE = 32
 
 SEQUENCE_GROUP_COLUMNS = ["Operator", "System ID", "Server IP Address"]
-EXCLUDED_FEATURE_COLUMNS = {TARGET_COLUMN, SPLIT_DATE_COLUMN, "_row_order"}
+EXCLUDED_FEATURE_COLUMNS = {
+    TARGET_COLUMN,
+    SPLIT_DATE_COLUMN,
+    "_row_order",
+    "_source_file",
+    "_is_synthetic_limited",
+    "_synthetic_episode_id",
+    "Network Access TA Start",
+}
+HISTORY_FEATURE_COLUMNS = [
+    "Sequence",
+    "network_access_start_seconds",
+    "Transfer Throughput [kbit/s]",
+    "Average Used Bandwidth DL",
+    "Maximum Available Bandwidth DL",
+    "LTE PCC PDSCH Throughput [kbit/s]",
+    "NR PCell DL Throughput [kbit/s]",
+    "NR PCell PDSCH Average Throughput [Mbit/s]",
+    "HTTP RTT First [ms]",
+    "LTE PCC SINR Avg",
+    "NR PCell SSB Serving Beam SINR Avg",
+]
 
 
 def set_reproducibility(seed: int = RANDOM_SEED) -> None:
@@ -58,7 +83,18 @@ def set_reproducibility(seed: int = RANDOM_SEED) -> None:
 def load_data(path: Path = DATA_PATH) -> pd.DataFrame:
     """Load and validate the final anonymized dataset."""
     if not path.exists():
-        raise FileNotFoundError(f"Final dataset not found: {path}")
+        if path == DATA_PATH:
+            if SEQUENCE_DATA_PATH.exists():
+                path = SEQUENCE_DATA_PATH
+            elif BASE_DATA_PATH.exists():
+                path = BASE_DATA_PATH
+            else:
+                raise FileNotFoundError(
+                    f"None of these datasets exist: {DATA_PATH}, "
+                    f"{SEQUENCE_DATA_PATH}, {BASE_DATA_PATH}"
+                )
+        else:
+            raise FileNotFoundError(f"Final dataset not found: {path}")
 
     data = pd.read_csv(path)
     required_columns = {TARGET_COLUMN, SPLIT_DATE_COLUMN}
@@ -73,12 +109,31 @@ def load_data(path: Path = DATA_PATH) -> pd.DataFrame:
         raise ValueError(f"{TARGET_COLUMN} must contain only binary 0/1 values")
 
     data["_row_order"] = np.arange(len(data))
-    return data.sort_values([SPLIT_DATE_COLUMN, "_row_order"]).reset_index(drop=True)
+    data = data.sort_values([SPLIT_DATE_COLUMN, "_row_order"]).reset_index(drop=True)
+    return add_engineered_features(data)
 
 
 def get_feature_columns(data: pd.DataFrame) -> list[str]:
     """Use every CSV column except the target and split-only helper fields."""
-    return [column for column in data.columns if column not in EXCLUDED_FEATURE_COLUMNS]
+    leakage_prefixes = ("cause_", "diagnostic_")
+    return [
+        column
+        for column in data.columns
+        if column not in EXCLUDED_FEATURE_COLUMNS
+        and not column.startswith(leakage_prefixes)
+    ]
+
+
+def sequence_order_columns(data: pd.DataFrame, group_columns: list[str]) -> list[str]:
+    """Return stable row order columns for time-aware feature engineering."""
+    order_columns = []
+    for column in group_columns + [SPLIT_DATE_COLUMN]:
+        if column in data.columns and column not in order_columns:
+            order_columns.append(column)
+    for column in ["Sequence", "network_access_start_seconds", "_row_order"]:
+        if column in data.columns:
+            order_columns.append(column)
+    return order_columns
 
 
 def chronological_masks(dates: pd.Series) -> dict[str, np.ndarray]:
@@ -90,6 +145,292 @@ def chronological_masks(dates: pd.Series) -> dict[str, np.ndarray]:
         "validation": ((dates > train_end) & (dates <= validation_end)).to_numpy(),
         "test": (dates > validation_end).to_numpy(),
     }
+
+
+def real_row_mask(data: pd.DataFrame) -> np.ndarray:
+    """Return rows that came from real measurements, not augmentation."""
+    if SYNTHETIC_COLUMN not in data.columns:
+        return np.ones(len(data), dtype=bool)
+    synthetic = pd.to_numeric(data[SYNTHETIC_COLUMN], errors="coerce").fillna(0)
+    return synthetic.eq(0).to_numpy()
+
+
+def numeric_column(data: pd.DataFrame, column: str) -> pd.Series:
+    """Return a numeric column with invalid values represented as NaN."""
+    return pd.to_numeric(data[column], errors="coerce")
+
+
+def safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    """Divide two numeric series while avoiding inf values."""
+    ratio = numerator / denominator.replace(0, np.nan)
+    return ratio.replace([np.inf, -np.inf], np.nan)
+
+
+def add_engineered_features(data: pd.DataFrame) -> pd.DataFrame:
+    """Add network-aware ratio and past-only history features."""
+    data = data.copy()
+
+    if {"Transfer Throughput [kbit/s]", "Average Used Bandwidth DL"} <= set(data.columns):
+        data["feature_transfer_to_average_bandwidth_ratio"] = safe_ratio(
+            numeric_column(data, "Transfer Throughput [kbit/s]"),
+            numeric_column(data, "Average Used Bandwidth DL"),
+        )
+    if {"Transfer Throughput [kbit/s]", "Maximum Available Bandwidth DL"} <= set(data.columns):
+        data["feature_transfer_to_max_bandwidth_ratio"] = safe_ratio(
+            numeric_column(data, "Transfer Throughput [kbit/s]"),
+            numeric_column(data, "Maximum Available Bandwidth DL"),
+        )
+    if {"Average Used Bandwidth DL", "Maximum Available Bandwidth DL"} <= set(data.columns):
+        data["feature_used_to_available_bandwidth_ratio"] = safe_ratio(
+            numeric_column(data, "Average Used Bandwidth DL"),
+            numeric_column(data, "Maximum Available Bandwidth DL"),
+        )
+    if {
+        "Transfer Throughput [kbit/s]",
+        "NR PCell PDSCH Average Throughput [Mbit/s]",
+    } <= set(data.columns):
+        data["feature_nr_pcell_avg_to_transfer_ratio"] = safe_ratio(
+            numeric_column(data, "NR PCell PDSCH Average Throughput [Mbit/s]") * 1000.0,
+            numeric_column(data, "Transfer Throughput [kbit/s]"),
+        )
+    if {"Transfer Throughput [kbit/s]", "LTE PCC PDSCH Throughput [kbit/s]"} <= set(data.columns):
+        data["feature_lte_pcc_to_transfer_ratio"] = safe_ratio(
+            numeric_column(data, "LTE PCC PDSCH Throughput [kbit/s]"),
+            numeric_column(data, "Transfer Throughput [kbit/s]"),
+        )
+    if {"HTTP RTT First [ms]", "Transfer Throughput [kbit/s]"} <= set(data.columns):
+        data["feature_rtt_per_transfer_throughput"] = safe_ratio(
+            numeric_column(data, "HTTP RTT First [ms]"),
+            numeric_column(data, "Transfer Throughput [kbit/s]"),
+        )
+
+    data = add_sequence_context_features(data)
+
+    group_columns = [column for column in SEQUENCE_GROUP_COLUMNS if column in data.columns]
+    if not group_columns:
+        return data
+
+    ordered = data.sort_values(sequence_order_columns(data, group_columns))
+    for column in HISTORY_FEATURE_COLUMNS:
+        if column not in ordered.columns:
+            continue
+        clean_name = clean_feature_name(column)
+        values = numeric_column(ordered, column)
+        grouped = values.groupby([ordered[group] for group in group_columns], dropna=False)
+        ordered[f"feature_{clean_name}_previous"] = grouped.shift(1)
+        ordered[f"feature_{clean_name}_rolling3_mean"] = grouped.transform(
+            lambda series: series.shift(1).rolling(3, min_periods=1).mean()
+        )
+        ordered[f"feature_{clean_name}_rolling3_std"] = grouped.transform(
+            lambda series: series.shift(1).rolling(3, min_periods=2).std()
+        )
+        ordered[f"feature_{clean_name}_delta_previous"] = values - grouped.shift(1)
+
+    engineered_columns = [column for column in ordered.columns if column.startswith("feature_")]
+    data = ordered.sort_index()
+    data[engineered_columns] = data[engineered_columns].replace([np.inf, -np.inf], np.nan)
+    return data.reset_index(drop=True)
+
+
+def add_sequence_context_features(data: pd.DataFrame) -> pd.DataFrame:
+    """Add ML features that describe local sequence/throughput context.
+
+    These features encode the workflow used during manual analysis: look at the
+    nearby points in the same drive-test/day context, check whether throughput
+    hits a local wall, and see whether the next/previous server change is paired
+    with recovery. They do not use the target label.
+    """
+    required = {"Sequence", "Transfer Throughput [kbit/s]", SPLIT_DATE_COLUMN}
+    if not required <= set(data.columns):
+        return data
+
+    context_group_columns = [
+        column
+        for column in [SPLIT_DATE_COLUMN, "Operator", "System ID", "Route Name"]
+        if column in data.columns
+    ]
+    if not context_group_columns:
+        return data
+
+    ordered = data.sort_values(sequence_order_columns(data, context_group_columns)).copy()
+    grouped = ordered.groupby(context_group_columns, dropna=False, sort=False)
+    throughput = numeric_column(ordered, "Transfer Throughput [kbit/s]")
+
+    previous_throughput = grouped["Transfer Throughput [kbit/s]"].shift(1)
+    next_throughput = grouped["Transfer Throughput [kbit/s]"].shift(-1)
+    previous_throughput = pd.to_numeric(previous_throughput, errors="coerce")
+    next_throughput = pd.to_numeric(next_throughput, errors="coerce")
+
+    ordered["feature_sequence_transfer_previous"] = previous_throughput
+    ordered["feature_sequence_transfer_next"] = next_throughput
+    ordered["feature_sequence_transfer_delta_previous"] = throughput - previous_throughput
+    ordered["feature_sequence_transfer_delta_next"] = next_throughput - throughput
+    ordered["feature_sequence_transfer_ratio_previous"] = safe_ratio(
+        throughput,
+        previous_throughput,
+    )
+    ordered["feature_sequence_transfer_ratio_next"] = safe_ratio(throughput, next_throughput)
+    ordered["feature_sequence_transfer_abs_pct_delta_previous"] = safe_ratio(
+        (throughput - previous_throughput).abs(),
+        previous_throughput.abs(),
+    )
+    ordered["feature_sequence_transfer_abs_pct_delta_next"] = safe_ratio(
+        (next_throughput - throughput).abs(),
+        throughput.abs(),
+    )
+
+    throughput_grouped = throughput.groupby(
+        [ordered[column] for column in context_group_columns],
+        dropna=False,
+        sort=False,
+    )
+    for window in [3, 5]:
+        prefix = f"feature_sequence_transfer_centered{window}"
+        ordered[f"{prefix}_mean"] = throughput_grouped.transform(
+            lambda series: series.rolling(window, center=True, min_periods=1).mean()
+        )
+        ordered[f"{prefix}_std"] = throughput_grouped.transform(
+            lambda series: series.rolling(window, center=True, min_periods=2).std()
+        )
+        ordered[f"{prefix}_min"] = throughput_grouped.transform(
+            lambda series: series.rolling(window, center=True, min_periods=1).min()
+        )
+        ordered[f"{prefix}_max"] = throughput_grouped.transform(
+            lambda series: series.rolling(window, center=True, min_periods=1).max()
+        )
+        ordered[f"{prefix}_range"] = (
+            ordered[f"{prefix}_max"] - ordered[f"{prefix}_min"]
+        )
+        ordered[f"{prefix}_to_mean_ratio"] = safe_ratio(
+            throughput,
+            ordered[f"{prefix}_mean"],
+        )
+
+    group_median = throughput_grouped.transform("median")
+    group_q25 = throughput_grouped.transform(lambda series: series.quantile(0.25))
+    group_q75 = throughput_grouped.transform(lambda series: series.quantile(0.75))
+    ordered["feature_sequence_transfer_day_group_rank_pct"] = throughput_grouped.rank(
+        pct=True
+    )
+    ordered["feature_sequence_transfer_to_day_group_median_ratio"] = safe_ratio(
+        throughput,
+        group_median,
+    )
+    ordered["feature_sequence_transfer_day_group_iqr_position"] = safe_ratio(
+        throughput - group_q25,
+        group_q75 - group_q25,
+    )
+
+    if "Server IP Address" in ordered.columns:
+        server_values = ordered["Server IP Address"].fillna("").astype(str)
+        previous_server = grouped["Server IP Address"].shift(1).fillna("").astype(str)
+        next_server = grouped["Server IP Address"].shift(-1).fillna("").astype(str)
+        ordered["feature_sequence_same_server_previous"] = (
+            server_values == previous_server
+        ).astype(float)
+        ordered["feature_sequence_same_server_next"] = (
+            server_values == next_server
+        ).astype(float)
+        ordered["feature_sequence_server_changed_previous"] = (
+            (previous_server != "") & (server_values != previous_server)
+        ).astype(float)
+        ordered["feature_sequence_server_changed_next"] = (
+            (next_server != "") & (server_values != next_server)
+        ).astype(float)
+        ordered["feature_sequence_next_server_recovery_ratio"] = np.where(
+            ordered["feature_sequence_server_changed_next"].eq(1),
+            safe_ratio(next_throughput, throughput),
+            np.nan,
+        )
+        ordered["feature_sequence_previous_server_drop_ratio"] = np.where(
+            ordered["feature_sequence_server_changed_previous"].eq(1),
+            safe_ratio(throughput, previous_throughput),
+            np.nan,
+        )
+
+        server_day_columns = [
+            column
+            for column in [SPLIT_DATE_COLUMN, "Server IP Address"]
+            if column in ordered.columns
+        ]
+        server_day_grouped = throughput.groupby(
+            [ordered[column] for column in server_day_columns],
+            dropna=False,
+            sort=False,
+        )
+        server_day_median = server_day_grouped.transform("median")
+        ordered["feature_server_day_row_count"] = server_day_grouped.transform("size")
+        ordered["feature_server_day_transfer_median"] = server_day_median
+        ordered["feature_server_day_transfer_std"] = server_day_grouped.transform("std")
+        ordered["feature_transfer_to_server_day_median_ratio"] = safe_ratio(
+            throughput,
+            server_day_median,
+        )
+        ordered = add_same_ip_run_features(
+            ordered,
+            context_group_columns,
+            throughput,
+        )
+
+    engineered_columns = [column for column in ordered.columns if column.startswith("feature_")]
+    ordered[engineered_columns] = ordered[engineered_columns].replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+    ordered = ordered.drop(columns=["_same_ip_run_id"], errors="ignore")
+    return ordered.sort_index()
+
+
+def add_same_ip_run_features(
+    ordered: pd.DataFrame,
+    context_group_columns: list[str],
+    throughput: pd.Series,
+) -> pd.DataFrame:
+    """Add features for contiguous sequence runs on one server IP.
+
+    Domain assumption: a true Akamai limitation episode belongs to one server IP,
+    not several IPs at once. These features let the model learn whether the row
+    sits inside a coherent same-IP throughput-wall segment.
+    """
+    output = ordered.copy()
+    context_grouped = output.groupby(context_group_columns, dropna=False, sort=False)
+    output["_same_ip_run_id"] = context_grouped["Server IP Address"].transform(
+        lambda values: values.fillna("missing").ne(values.fillna("missing").shift()).cumsum()
+    )
+    run_group_columns = context_group_columns + ["_same_ip_run_id"]
+    run_grouped = output.groupby(run_group_columns, dropna=False, sort=False)
+    throughput_by_run = throughput.groupby(
+        [output[column] for column in run_group_columns],
+        dropna=False,
+        sort=False,
+    )
+
+    output["feature_same_ip_run_length"] = run_grouped["Server IP Address"].transform("size")
+    output["feature_same_ip_run_position"] = run_grouped.cumcount() + 1
+    output["feature_same_ip_run_position_pct"] = safe_ratio(
+        output["feature_same_ip_run_position"],
+        output["feature_same_ip_run_length"],
+    )
+    output["feature_same_ip_run_transfer_mean"] = throughput_by_run.transform("mean")
+    output["feature_same_ip_run_transfer_std"] = throughput_by_run.transform("std")
+    output["feature_same_ip_run_transfer_min"] = throughput_by_run.transform("min")
+    output["feature_same_ip_run_transfer_max"] = throughput_by_run.transform("max")
+    output["feature_same_ip_run_transfer_range"] = (
+        output["feature_same_ip_run_transfer_max"]
+        - output["feature_same_ip_run_transfer_min"]
+    )
+    output["feature_transfer_to_same_ip_run_mean_ratio"] = safe_ratio(
+        throughput,
+        output["feature_same_ip_run_transfer_mean"],
+    )
+    output["feature_same_ip_run_wall_tightness"] = safe_ratio(
+        output["feature_same_ip_run_transfer_range"],
+        output["feature_same_ip_run_transfer_mean"].abs(),
+    )
+    output["feature_same_ip_run_has_3plus_rows"] = (
+        output["feature_same_ip_run_length"] >= 3
+    ).astype(float)
+    return output
 
 
 def stable_hash_bucket(value: str, buckets: int = HASH_BUCKETS) -> int:
@@ -120,6 +461,7 @@ def build_feature_matrix(
     categorical_columns = [column for column in feature_columns if column not in numeric_columns]
 
     numeric_data = data[numeric_columns].to_numpy(dtype=float)
+    numeric_data[~np.isfinite(numeric_data)] = np.nan
     train_numeric = numeric_data[train_mask]
     medians = np.nanmedian(train_numeric, axis=0)
     medians = np.where(np.isnan(medians), 0.0, medians)
@@ -162,7 +504,7 @@ def make_sequences(
 
     ordered = data.copy()
     ordered["_matrix_index"] = np.arange(len(ordered))
-    ordered = ordered.sort_values(group_columns + [SPLIT_DATE_COLUMN, "_row_order"])
+    ordered = ordered.sort_values(sequence_order_columns(ordered, group_columns))
     ordered = ordered.reset_index(drop=True)
 
     x_values = feature_matrix[ordered["_matrix_index"].to_numpy()]
@@ -421,14 +763,16 @@ def run_legacy_comparable_lstm(
     from tensorflow import keras
 
     targets = data[TARGET_COLUMN].to_numpy(dtype=int)
-    row_indices = np.arange(len(data))
+    real_indices = np.flatnonzero(real_row_mask(data))
+    synthetic_indices = np.flatnonzero(~real_row_mask(data))
     train_indices, test_indices = train_test_split(
-        row_indices,
+        real_indices,
         test_size=0.3,
         shuffle=True,
         random_state=1,
-        stratify=targets,
+        stratify=targets[real_indices],
     )
+    train_indices = np.concatenate([train_indices, synthetic_indices])
 
     train_mask = np.zeros(len(data), dtype=bool)
     test_mask = np.zeros(len(data), dtype=bool)
@@ -509,6 +853,7 @@ def run_legacy_comparable_lstm(
         "sequence_length": 1,
         "hash_buckets_per_categorical_column": HASH_BUCKETS,
         "train_rows": int(len(train_indices)),
+        "synthetic_train_rows": int(len(synthetic_indices)),
         "test_rows": int(len(test_indices)),
         "train_positives": int(y_train.sum()),
         "test_positives": int(y_test.sum()),
